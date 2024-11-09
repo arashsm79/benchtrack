@@ -1,0 +1,14 @@
+[project]
+name = "benchtrack"
+version = "0.1.0"
+description = "Benchmarking point tracking for pose estimation"
+readme = "README.md"
+authors = [
+    { name = "Arash Sal Moslehian", email = "arashmoslehian@protonmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
