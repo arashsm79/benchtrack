@@ -6,8 +6,9 @@ readme = "README.md"
 authors = [
     { name = "Arash Sal Moslehian", email = "arashmoslehian@protonmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
+    "cotracker",
     "datajoint>=0.14.3",
     "graphviz>=0.20.3",
     "imageio[ffmpeg]>=2.36.0",
@@ -25,6 +26,13 @@ dependencies = [
     "tables>=3.10.1",
     "torch>=2.5.1",
 ]
+
+
+[tool.uv.sources]
+cotracker = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*"]
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,9 @@
+[submodule "packages/co-tracker"]
+	path = packages/co-tracker
+	url = https://github.com/arashsm79/co-tracker
+[submodule "packages/packages/cotracker"]
+	path = packages/packages/cotracker
+	url = https://github.com/arashsm79/co-tracker
+[submodule "packages/cotracker"]
+	path = packages/cotracker
+	url = https://github.com/arashsm79/co-tracker
