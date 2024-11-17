@@ -70,30 +70,32 @@ def import_from_horse30(dir_path: str):
             df = df.get(df.columns.levels[0][0]) # remove scorer name
             body_parts = sorted(df.columns.levels[0].to_list())
 
-            Session.Segments.insert1({
-                'project_id': project_id,
-                'session_id': session_id,
-                'subject_id': subject_id,
-                'segment_names': body_parts
-            }, skip_duplicates=True)
+            for segment in body_parts:
+                Session.Segment.insert1({
+                    'project_id': project_id,
+                    'session_id': session_id,
+                    'segment_name': segment
+                }, skip_duplicates=True)
 
             # Prepare data for AnnotatedKeypoints
             num_frames = len(df)
             assert num_frames == len(video)
             frame_indices = range(num_frames)
             num_bodyparts = len(body_parts)
-            pose = np.zeros((num_frames, num_bodyparts, 2))
-            for frame_idx, (index, row) in enumerate(df.iterrows()):
-                for part_idx, part in enumerate(body_parts):
-                    pose[frame_idx, part_idx, 0] = row[part, 'x']
-                    pose[frame_idx, part_idx, 1] = row[part, 'y']
-            
-            Session.AnnotatedKeypoints.insert1({
-                'project_id': project_id,
-                'session_id': session_id,
-                'subject_id': subject_id,
-                'frame_idx': frame_indices,
-                'pose': pose,
-                'likelihood': None
-            }, skip_duplicates=True)
+            for segment in body_parts:
+                pose = np.zeros((num_frames, 2))
+                for frame_idx, (index, row) in enumerate(df.iterrows()):
+                    pose[frame_idx, 0] = row[segment, 'x']
+                    pose[frame_idx, 1] = row[segment, 'y']
+                Session.AnnotatedKeypoint.insert1({
+                    'project_id': project_id,
+                    'session_id': session_id,
+                    'subject_id': subject_id,
+                    'segment_name': segment,
+                    'frame_idx': frame_indices,
+                    'pose': pose,
+                    'likelihood': None
+                }, skip_duplicates=True)
+
             print(f"Imported {subject_name}.")
+            return
