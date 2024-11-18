@@ -12,6 +12,7 @@ import datajoint as dj
 import cv2
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 import debugpy
 
 # Configure logging
@@ -57,6 +58,7 @@ class Session(dj.Manual):
         -> master
         segment_name: varchar(64)
         ---
+        segment_color: varchar(32)
         segment_description=''  : varchar(1024)
         """
 
@@ -167,45 +169,61 @@ class TrackingWorker:
         return cfg
 
 @schema
+class TrackingBenchmarkSettingsLookup(dj.Lookup):
+    definition = """
+    setting_id: int
+    ---
+    window_size: int
+    rmse_threshold: float
+    """
+
+    contents = [
+        {"setting_id": "1", "window_size": "20", "rmse_threshold": "3"},
+        {"setting_id": "2", "window_size": "10", "rmse_threshold": "5"},
+    ]
+
+@schema
 class TrackingBenchmark(dj.Computed):
     definition = """
     -> Session
+    -> TrackingBenchmarkSettingsLookup
     ---
     keypoint_order: longblob
+    keypoint_info: longblob
     tracked_keypoints: longblob
+    annotated_keypoints: longblob
     tracking_events: longblob
     """
 
     tracker = TrackingWorker()
 
     def make(self, key):
-        subjects = (Session.Subject & key).fetch(as_dict=True)
         video = (Video & key).fetch1('video')
         annotated_keypoints_raw = (Session.AnnotatedKeypoint & key).fetch(as_dict=True)
-        segments = (Session.Segment & key).fetch(as_dict=True)
 
-        window_size = 20
-        rmse_threshold = 3
+        # get the key of setting
+        setting_key, window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & {'setting_id': 1}).fetch1('KEY', 'window_size', 'rmse_threshold')
 
         num_frames = len(video)
-        
+        # fetch the color from Session.Segments using the name in AnnotatedKeypoint
+        kp_colors = [(Session.Segment & kp_key).fetch1('segment_color') for kp_key in annotated_keypoints_raw]
         # Create a dictionary for quick lookup of keypoints
-        keypoint_pose = {(kp['subject_id'], kp['segment_name']): kp['pose'] for kp in annotated_keypoints_raw}
+        keypoint_pose = {(kp['subject_id'], kp['segment_name'], kp_color): kp['pose'] for kp, kp_color in zip(annotated_keypoints_raw, kp_colors)}
         keypoint_order = keypoint_pose.keys()
 
         annotated_keypoints = []
         annotated_keypoints_info = []
 
-        tracking_events = []
 
         for frame_idx in range(num_frames):
-            for (segment_name, subject_id), pose in keypoint_pose.items():
+            for (segment_name, subject_id, segment_color), pose in keypoint_pose.items():
                 annotated_keypoints.append([frame_idx, pose[frame_idx][0], pose[frame_idx][1]])
-                annotated_keypoints_info.append([frame_idx, segment_name, subject_id])
+                annotated_keypoints_info.append([frame_idx, segment_name, subject_id, segment_color])
 
         annotated_keypoints = np.array(annotated_keypoints) # (num_frames * num_keypoints, 3) where the columns are frame_idx, x, y
-        annotated_keypoints_info = pd.DataFrame(annotated_keypoints_info, columns=['frame_idx', 'segment_name', 'subject_id']) # (num_frames * num_keypoints, 3) where the columns are frame_idx, segment_name, subject_id
+        annotated_keypoints_info = pd.DataFrame(annotated_keypoints_info, columns=['frame_idx', 'segment_name', 'subject_id', 'segment_color']) # (num_frames * num_keypoints, 3) where the columns are frame_idx, segment_name, subject_id
 
+        tracking_events = np.zeros((num_frames, len(keypoint_order)), dtype=bool)
         
         tracked_keypoints = annotated_keypoints.copy()
         tracked_keypoints[:, 1:] = np.nan

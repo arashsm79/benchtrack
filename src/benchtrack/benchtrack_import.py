@@ -4,6 +4,7 @@ import glob
 import cv2
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from benchtrack.benchtrack_dj import Project, Subject, Session, Video, VideoInfo
 
@@ -70,11 +71,17 @@ def import_from_horse30(dir_path: str):
             df = df.get(df.columns.levels[0][0]) # remove scorer name
             body_parts = sorted(df.columns.levels[0].to_list())
 
-            for segment in body_parts:
+            def generate_bright_colors(n):
+                from matplotlib.colors import to_hex
+                colors = plt.cm.hsv(np.linspace(0, 1, n))  # 'hsv' provides distinct hues
+                return [to_hex(color) for color in colors]
+
+            for segment, color in zip(body_parts, generate_bright_colors(len(body_parts))):
                 Session.Segment.insert1({
                     'project_id': project_id,
                     'session_id': session_id,
-                    'segment_name': segment
+                    'segment_name': segment,
+                    'segment_color': color
                 }, skip_duplicates=True)
 
             # Prepare data for AnnotatedKeypoints
