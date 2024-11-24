@@ -2,6 +2,7 @@
 Inspired from elements
 """
 import os
+import pickle
 import glob
 import time
 import sys
@@ -17,6 +18,23 @@ import debugpy
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
+
+def config_plots():
+    # Global configuration for matplotlib
+    plt.rcParams.update({
+        'font.size': 16,  # Font size for text
+        'font.family': 'sans-serif',  # Font family
+        'axes.titlesize': 18,  # Font size for axes titles
+        'axes.labelsize': 16,  # Font size for axes labels
+        'xtick.labelsize': 14,  # Font size for x-tick labels
+        'ytick.labelsize': 14,  # Font size for y-tick labels
+        'legend.fontsize': 18,  # Font size for legend
+        'lines.linewidth': 3,  # Line width
+        'figure.dpi': 100,  # Figure DPI
+        'lines.linewidth': 2,  # Line width
+        'lines.markersize': 8,  # Marker size
+        'axes.titleweight': 'bold'
+    })
 
 schema = dj.Schema("benchtrack")
 
@@ -101,7 +119,6 @@ class VideoInfo(dj.Manual):
     """
 
 
-# just an example of one way to pass data to cotracker
 class TrackingWorker:
 
     @dataclass
@@ -135,9 +152,6 @@ class TrackingWorker:
         video = np.array(cfg.video)
         window_frames = []
 
-        # We need to swap x, y so that it matches what cotracker expects 
-        # cfg.keypoints[:, [1, 2]] = cfg.keypoints[:, [2, 1]]
-
         queries = torch.from_numpy(cfg.keypoints).to(self.device).float()
         
         # Iterating over video frames, processing one window at a time:
@@ -149,7 +163,6 @@ class TrackingWorker:
             window_frames.append(frame)
 
         # Processing final frames in case video length is not a multiple of model.step
-        # TODO: Use visibility
         pred_tracks, _pred_visibility = _process_step(
             window_frames[-(i % self.model.step) - self.model.step - 1:],
             is_first_step,
@@ -187,13 +200,18 @@ class TrackingBenchmark(dj.Computed):
     definition = """
     -> Session
     -> TrackingBenchmarkSettingsLookup
-    ---
-    keypoint_order: longblob
-    keypoint_info: longblob
-    tracked_keypoints: longblob
-    annotated_keypoints: longblob
-    tracking_events: longblob
     """
+
+    class TrackedKeypoint(dj.Part):
+        definition = """
+        -> master
+        -> Session.Subject
+        -> Session.Segment
+        ---
+        pose: longblob
+        rmse: longblob
+        tracking_events: longblob
+        """
 
     tracker = TrackingWorker()
 
@@ -201,8 +219,7 @@ class TrackingBenchmark(dj.Computed):
         video = (Video & key).fetch1('video')
         annotated_keypoints_raw = (Session.AnnotatedKeypoint & key).fetch(as_dict=True)
 
-        # get the key of setting
-        setting_key, window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & {'setting_id': 1}).fetch1('KEY', 'window_size', 'rmse_threshold')
+        window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & {'setting_id': 1}).fetch1('window_size', 'rmse_threshold')
 
         num_frames = len(video)
         # fetch the color from Session.Segments using the name in AnnotatedKeypoint
@@ -229,7 +246,9 @@ class TrackingBenchmark(dj.Computed):
         tracked_keypoints[:, 1:] = np.nan
         # set the rows corresponding to the first frame
 
-        for frame_idx in range(num_frames-8):
+        end_slack = 8
+
+        for frame_idx in range(num_frames-end_slack):
             # compare current_keypoints with annotated_keypoints for frame_idx and 
             # return the indices of the keypoints in the current frame (in terms of keypoint_order) that have a rmse higher than threshold or
             # are in annotated_keypoints but are not in current_keypoints
@@ -242,6 +261,8 @@ class TrackingBenchmark(dj.Computed):
             keypoints_to_track[keypoints_to_track_idx] = annotated_keypoints[annotated_keypoints[:, 0] == frame_idx][keypoints_to_track_idx]
             keypoints_to_track_info = annotated_keypoints_info[annotated_keypoints_info['frame_idx'] == frame_idx]
 
+            # TODO: if we are in the last iteration, retrack to end all the keypoints in the (last_frame - end_lack - 1) frame that are nan in the last end_slack frames.
+
             # drop rows with nan from keypoints_to_track and keypoints_to_track_info
             keypoints_to_track_info = keypoints_to_track_info.iloc[~np.isnan(keypoints_to_track).any(axis=1)]
             keypoints_to_track = keypoints_to_track[~np.isnan(keypoints_to_track).any(axis=1)]
@@ -249,15 +270,15 @@ class TrackingBenchmark(dj.Computed):
             if len(keypoints_to_track) == 0:
                 continue
 
-            tracking_events.append((frame_idx, keypoints_to_track_idx))
+            tracking_events[frame_idx, keypoints_to_track_idx] = True
             
             # set frame column to 0
             keypoints_to_track[:, 0] = 0
-            if frame_idx + window_size >= num_frames:
-                window_size = num_frames - frame_idx - 1
+            if frame_idx + window_size > num_frames:
+                window_size = num_frames - frame_idx
             # track from the current frame to the next window_size frames
             # with keypoints_to_track
-            print(f"Tracking {len(keypoints_to_track)} keypoints from frame {frame_idx} to frame {frame_idx + window_size}")
+            logging.debug(f"Tracking {len(keypoints_to_track)} keypoints from frame {frame_idx} to frame {frame_idx + window_size}")
             tracking_data = TrackingBenchmark.tracker.track(TrackingWorker.TrackingWorkerData(
                 tracker="cotracker",
                 video=video[frame_idx:frame_idx + window_size],
@@ -273,35 +294,135 @@ class TrackingBenchmark(dj.Computed):
                 # This is voodoo; but the question is, is this too much?
                 tracked_keypoints[(tracked_keypoints[:, 0] == f_idx).nonzero()[0][tracking_data.keypoint_order_idx]] = tracking_data.keypoints[tracking_data.keypoints[:, 0] == f_idx]
 
-        # create an mp4 file with the tracked keypoints which is of shape (num_frames, 3) where the columns are frame_idx, x, y
-        # and the order of the keypoints in each frame is the same as in keypoint_order which corresponds to keypoint_info
-        out_video_path = "tracked_video.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        height, width = video[0].shape[:2]
-        out = cv2.VideoWriter(out_video_path, fourcc, 10.0, (width, height))
+        # Reshape them back to (num_frames, num_keypoints, 2)
+        num_keypoints = len(keypoint_order)
+        rmse_values = np.full((num_frames, num_keypoints), np.nan)
+        tracked_keypoints_reshaped = np.zeros((num_frames, num_keypoints, 2))
+        for frame_idx in range(num_frames):
+            for kp_idx in range(num_keypoints):
+                tracked_kp = tracked_keypoints[(tracked_keypoints[:, 0] == frame_idx)][kp_idx][1:]
+                annotated_kp = annotated_keypoints[(annotated_keypoints[:, 0] == frame_idx)][kp_idx][1:]
+                tracked_keypoints_reshaped[frame_idx, kp_idx] = tracked_kp
+                rmse = np.sqrt(np.mean((tracked_kp - annotated_kp) ** 2))
+                rmse_values[frame_idx, kp_idx] = rmse
 
+        # insert the tracked keypoints one by one
+        self.insert1(key, skip_duplicates=True)
+        for kp_idx, (kp_subject_id, kp_name, kp_color) in enumerate(keypoint_order):
+            self.TrackedKeypoint.insert1({
+                **key,
+                'subject_id': kp_subject_id,
+                'segment_name': kp_name,
+                'pose': tracked_keypoints_reshaped[:, kp_idx],
+                'rmse': rmse_values[:, kp_idx],
+                'tracking_events': tracking_events[:, kp_idx]
+            })
+
+
+    def render_overlay(key, output_filepath):
+        import matplotlib.colors as mcolors
+        video = (Video & key).fetch1('video')
+        keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+        keypoint_colors = [(Session.Segment & kp_key).fetch1('segment_color') for kp_key in keypoint_data]
+        fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+        height, width = video[0].shape[:2]
+        out = cv2.VideoWriter(output_filepath, fourcc, 10.0, (width, height))
         for frame_idx, frame in enumerate(video):
             frame = frame.copy()  # Make the frame writable
-            for kp in tracked_keypoints[tracked_keypoints[:, 0] == frame_idx]:
+            for keypoint_datum, keypoint_color in zip(keypoint_data, keypoint_colors):
+                kp = keypoint_datum['pose'][frame_idx]
                 if not np.isnan(kp).any():
-                    cv2.circle(frame, (int(kp[1]), int(kp[2])), 2, (0, 255, 0), -1)
+                    color = tuple(int(c * 255) for c in mcolors.hex2color(keypoint_color))
+                    cv2.circle(frame, (int(kp[0]), int(kp[1])), 2, color, -1)
             out.write(frame)
-
         out.release()
 
+    def plot_keypoint_rmse(key):
+        config_plots()
+        keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+        window_size, rmse_threshold = key.fetch1('window_size', 'rmse_threshold')
 
-        key['keypoint_order'] = keypoint_order
-        key['tracked_keypoints'] = tracked_keypoints
-        key['tracking_events'] = tracking_events
+        num_keypoints = len(keypoint_data)
 
-        # self.insert1(key)
+        fig, axes = plt.subplots(num_keypoints, 1, figsize=(20, 6 * num_keypoints), sharex=True)
+        if num_keypoints == 1:
+            axes = [axes]
 
-    def render_overlay(self, key):
-        pass
+        for kp_idx, keypoint_datum in enumerate(keypoint_data):
+            num_frames = len(keypoint_datum['rmse'])
+            ax = axes[kp_idx]
+            kp_name = keypoint_datum['segment_name']
+            kp_color = (Session.Segment & keypoint_datum & f'segment_name="{kp_name}"').fetch1('segment_color')
+            ax.plot(keypoint_datum['rmse'], label=kp_name, color=kp_color)
+            event_frames = np.where(keypoint_datum['tracking_events'])[0]
+            for event_frame in event_frames:
+                ax.axvline(event_frame, linestyle='--', color='black')
+            ax.axhline(rmse_threshold, linestyle='--', color='red', label='Threshold')
+            ax.set_ylabel('RMSE')
+            ax.set_title(f'RMSE of {kp_name} Over Frames (window_size={window_size})')
+            ax.legend()
+            ax.set_xticks(np.arange(0, num_frames, 5))
+            ax.set_xticklabels(np.arange(0, num_frames, 5))
+
+        plt.xlabel('Frames')
+        plt.show()
+
+    def stat_table(key):
+        keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+    
+        # Prepare the table data
+        table_data = []
+        for keypoint_datum in keypoint_data:
+            subject_id = keypoint_datum['subject_id']
+            segment_name = keypoint_datum['segment_name']
+            avg_rmse = np.nanmean(keypoint_datum['rmse'])
+            num_events = np.sum(keypoint_datum['tracking_events']) - 9
+            
+            table_data.append([subject_id, segment_name, avg_rmse, num_events])
+        
+        # Create a DataFrame for better visualization
+        df = pd.DataFrame(table_data, columns=['Subject', 'Segment Name', 'Average RMSE', 'Number of Events'])
+        
+        # Plot the number of events
+        plt.figure(figsize=(10, 6))
+        plt.bar(df['Segment Name'], df['Number of Events'], color='skyblue')
+        plt.xlabel('Segment Name')
+        plt.ylabel('Number of Events (Normalized)')
+        plt.title('Number of Events per Segment')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+        
+        # Plot the average RMSE
+        plt.figure(figsize=(10, 6))
+        plt.bar(df['Segment Name'], df['Average RMSE'], color='salmon')
+        plt.xlabel('Segment Name')
+        plt.ylabel('Average RMSE')
+        plt.title('Average RMSE per Segment')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        # Plot the total number of events per frame
+        total_events_per_frame = np.sum([keypoint_datum['tracking_events'] for keypoint_datum in keypoint_data], axis=0)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(total_events_per_frame, color='purple')
+        plt.xlabel('Frames')
+        plt.ylabel('Total Number of Events')
+        plt.title('Total Number of Events per Frame')
+        plt.tight_layout()
+        plt.show()
+
+        return df
+
+
 
 
 
             
 
 if __name__ == "__main__":
-    TrackingBenchmark.populate()
+    session_to_benchmark = Session * (TrackingBenchmarkSettingsLookup & 'setting_id=1')
+    TrackingBenchmark.populate(session_to_benchmark)
+    TrackingBenchmark.render_overlay(session_to_benchmark, 'tracked.mp4')
