@@ -149,6 +149,8 @@ class TrackingWorker:
             )  # (1, T, 3, H, W)
             return self.model(video_chunk, is_first_step=is_first_step, queries=queries[None], add_support_grid=True)
         # video is originally of shape (num_frames, height, width, channels)
+        if cfg.backward_tracking:
+            cfg.video = cfg.video[::-1]
         video = np.array(cfg.video)
         window_frames = []
 
@@ -177,6 +179,10 @@ class TrackingWorker:
             tracks = tracks[::-1]
         frame_ids = np.repeat(np.arange(cfg.keypoint_range[0], cfg.keypoint_range[1]), cfg.keypoints.shape[0])
         tracks = np.column_stack((frame_ids, tracks))
+        # The order of keypoints in each frame is now reversed. We go through each frame and reverse the order of keypoints
+        if cfg.backward_tracking:
+            for frame_idx in range(cfg.keypoint_range[0], cfg.keypoint_range[1]):
+                tracks[(tracks[:, 0] == frame_idx).nonzero()[0]] = tracks[tracks[:, 0] == frame_idx][::-1]
         cfg.keypoint_features = pd.concat([cfg.keypoint_features] * len(np.unique(tracks[:, 0])), ignore_index=True)
         cfg.keypoints = tracks
         return cfg
@@ -210,6 +216,12 @@ class TrackingBenchmark(dj.Computed):
         ---
         pose: longblob
         rmse: longblob
+        forward_pose: longblob
+        forward_rmse: longblob
+        start_frame_idx: int
+        bothway_pose: longblob
+        bothway_rmse: longblob
+        middle_frame_idx: int
         tracking_events: longblob
         """
 
@@ -219,7 +231,7 @@ class TrackingBenchmark(dj.Computed):
         video = (Video & key).fetch1('video')
         annotated_keypoints_raw = (Session.AnnotatedKeypoint & key).fetch(as_dict=True)
 
-        window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & {'setting_id': 1}).fetch1('window_size', 'rmse_threshold')
+        window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & key).fetch1('window_size', 'rmse_threshold')
 
         num_frames = len(video)
         # fetch the color from Session.Segments using the name in AnnotatedKeypoint
@@ -306,6 +318,94 @@ class TrackingBenchmark(dj.Computed):
                 rmse = np.sqrt(np.mean((tracked_kp - annotated_kp) ** 2))
                 rmse_values[frame_idx, kp_idx] = rmse
 
+
+        ### Track from start to end
+        start_frame_idx = 0
+        forward_rmse = np.full((num_frames, num_keypoints), np.nan)
+        # track from the current frame to the last frames
+        logging.debug(f"Tracking keypoints from frame {start_frame_idx} to frame {len(video)}.")
+        # find the first frame where all keypoints are annotated
+        while True:
+            if np.any(np.isnan(annotated_keypoints[annotated_keypoints[:, 0] == start_frame_idx, 1:])):
+                start_frame_idx += 1
+            else:
+                break
+        keypoints_to_track = annotated_keypoints[annotated_keypoints[:, 0] == start_frame_idx]
+        keypoints_to_track[:, 0] = 0
+        tracking_data = TrackingBenchmark.tracker.track(TrackingWorker.TrackingWorkerData(
+            tracker="cotracker",
+            video=video[start_frame_idx:len(video)],
+            keypoints=keypoints_to_track,
+            keypoint_features=annotated_keypoints_info[annotated_keypoints_info['frame_idx'] == start_frame_idx],
+            keypoint_order_idx=range(num_keypoints),
+            keypoint_range=(start_frame_idx, len(video)),
+            backward_tracking=False
+        ))
+        # calculate forward_rmse from tracking_data
+        forward_tracked_keypoints_reshaped = np.zeros((num_frames, num_keypoints, 2))
+        for f_idx in range(start_frame_idx, len(video)):
+            for kp_idx in range(num_keypoints):
+                tracked_kp = tracking_data.keypoints[tracking_data.keypoints[:, 0] == f_idx][kp_idx][1:]
+                annotated_kp = annotated_keypoints[annotated_keypoints[:, 0] == f_idx][kp_idx][1:]
+                forward_tracked_keypoints_reshaped[f_idx, kp_idx] = tracked_kp
+                rmse = np.sqrt(np.mean((tracked_kp - annotated_kp) ** 2))
+                forward_rmse[f_idx, kp_idx] = rmse
+
+        ### Track from middle to start and then middle to end
+        bothway_rmse = np.full((num_frames, num_keypoints), np.nan)
+        middle_frame_idx = len(video) // 2
+        # find the closest frame to the center that has all the keypoints annotated
+        while True:
+            if np.any(np.isnan(annotated_keypoints[annotated_keypoints[:, 0] == middle_frame_idx, 1:])):
+                middle_frame_idx += 1
+            else:
+                break
+        # track from the current frame to the last frames
+        logging.debug(f"Tracking keypoints from frame {middle_frame_idx} to frame {len(video)}")
+        keypoints_to_track = annotated_keypoints[annotated_keypoints[:, 0] == middle_frame_idx]
+        keypoints_to_track[:, 0] = 0
+        tracking_data = TrackingBenchmark.tracker.track(TrackingWorker.TrackingWorkerData(
+            tracker="cotracker",
+            video=video[middle_frame_idx:len(video)],
+            keypoints=keypoints_to_track,
+            keypoint_features=annotated_keypoints_info[annotated_keypoints_info['frame_idx'] == middle_frame_idx],
+            keypoint_order_idx=range(num_keypoints),
+            keypoint_range=(middle_frame_idx, len(video)),
+            backward_tracking=False
+        ))
+        # calculate bothway_rmse from tracking_data
+        bothway_tracked_keypoints_reshaped = np.zeros((num_frames, num_keypoints, 2))
+        for f_idx in range(tracking_data.keypoint_range[0], tracking_data.keypoint_range[1]):
+            for kp_idx in range(num_keypoints):
+                tracked_kp = tracking_data.keypoints[tracking_data.keypoints[:, 0] == f_idx][kp_idx][1:]
+                annotated_kp = annotated_keypoints[annotated_keypoints[:, 0] == f_idx][kp_idx][1:]
+                bothway_tracked_keypoints_reshaped[f_idx, kp_idx] = tracked_kp
+                rmse = np.sqrt(np.mean((tracked_kp - annotated_kp) ** 2))
+                bothway_rmse[f_idx, kp_idx] = rmse
+        
+        # Track from middle to start
+        # Track from the current frame to the first frame
+        logging.debug(f"Tracking keypoints from frame {middle_frame_idx} to frame {0}")
+        keypoints_to_track = annotated_keypoints[annotated_keypoints[:, 0] == middle_frame_idx]
+        keypoints_to_track[:, 0] = 0
+        tracking_data = TrackingBenchmark.tracker.track(TrackingWorker.TrackingWorkerData(
+            tracker="cotracker",
+            video=video[0:middle_frame_idx+1],
+            keypoints=keypoints_to_track,
+            keypoint_features=annotated_keypoints_info[annotated_keypoints_info['frame_idx'] == middle_frame_idx],
+            keypoint_order_idx=range(num_keypoints),
+            keypoint_range=(0, middle_frame_idx+1),
+            backward_tracking=True
+        ))
+        # calculate bothway_rmse from tracking_data
+        for f_idx in range(tracking_data.keypoint_range[0], tracking_data.keypoint_range[1]):
+            for kp_idx in range(num_keypoints):
+                tracked_kp = tracking_data.keypoints[tracking_data.keypoints[:, 0] == f_idx][kp_idx][1:]
+                annotated_kp = annotated_keypoints[annotated_keypoints[:, 0] == f_idx][kp_idx][1:]
+                bothway_tracked_keypoints_reshaped[f_idx, kp_idx] = tracked_kp
+                rmse = np.sqrt(np.mean((tracked_kp - annotated_kp) ** 2))
+                bothway_rmse[f_idx, kp_idx] = rmse
+
         # insert the tracked keypoints one by one
         self.insert1(key, skip_duplicates=True)
         for kp_idx, (kp_subject_id, kp_name, kp_color) in enumerate(keypoint_order):
@@ -315,11 +415,17 @@ class TrackingBenchmark(dj.Computed):
                 'segment_name': kp_name,
                 'pose': tracked_keypoints_reshaped[:, kp_idx],
                 'rmse': rmse_values[:, kp_idx],
+                'forward_rmse': forward_rmse[:, kp_idx],
+                'forward_pose': forward_tracked_keypoints_reshaped[:, kp_idx],
+                'start_frame_idx': start_frame_idx,
+                'bothway_rmse': bothway_rmse[:, kp_idx],
+                'bothway_pose': bothway_tracked_keypoints_reshaped[:, kp_idx],
+                'middle_frame_idx': middle_frame_idx,
                 'tracking_events': tracking_events[:, kp_idx]
             })
 
 
-    def render_overlay(key, output_filepath):
+    def render_overlay(key, output_filepath, pose_key_name='pose'):
         import matplotlib.colors as mcolors
         video = (Video & key).fetch1('video')
         keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
@@ -330,13 +436,35 @@ class TrackingBenchmark(dj.Computed):
         for frame_idx, frame in enumerate(video):
             frame = frame.copy()  # Make the frame writable
             for keypoint_datum, keypoint_color in zip(keypoint_data, keypoint_colors):
-                kp = keypoint_datum['pose'][frame_idx]
+                kp = keypoint_datum[pose_key_name][frame_idx]
                 if not np.isnan(kp).any():
                     color = tuple(int(c * 255) for c in mcolors.hex2color(keypoint_color))
                     cv2.circle(frame, (int(kp[0]), int(kp[1])), 2, color, -1)
             out.write(frame)
         out.release()
 
+    def plot_rmse_landscape(key):
+        # plot the forward_rmse and bothway_rmse for each keypoint
+        keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+        num_keypoints = len(keypoint_data)
+        fig, axes = plt.subplots(num_keypoints, 1, figsize=(20, 6 * num_keypoints), sharex=True)
+        if num_keypoints == 1:
+            axes = [axes]
+
+        for kp_idx, keypoint_datum in enumerate(keypoint_data):
+            ax = axes[kp_idx]
+            kp_name = keypoint_datum['segment_name']
+            kp_color = (Session.Segment & keypoint_datum & f'segment_name="{kp_name}"').fetch1('segment_color')
+            ax.plot(keypoint_datum['forward_rmse'], label='Forward RMSE', color='blue')
+            ax.plot(keypoint_datum['bothway_rmse'], label='Bothway RMSE', color='green')
+            ax.axvline(keypoint_datum['start_frame_idx'], linestyle='--', color='black', label='Start Frame')
+            ax.axvline(keypoint_datum['middle_frame_idx'], linestyle='--', color='black', label='Middle Frame')
+            ax.set_ylabel('RMSE')
+            ax.set_title(f'RMSE of {kp_name} Over Frames')
+            ax.legend()
+            ax.set_xticks(np.arange(0, len(keypoint_datum['forward_rmse']), 5))
+            ax.set_xticklabels(np.arange(0, len(keypoint_datum['forward_rmse']), 5))
+    
     def plot_keypoint_rmse(key):
         config_plots()
         keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
@@ -367,52 +495,140 @@ class TrackingBenchmark(dj.Computed):
         plt.xlabel('Frames')
         plt.show()
 
-    def stat_table(key):
-        keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
-    
-        # Prepare the table data
+    def stat_table(keys):
+        if not isinstance(keys, list):
+            keys = [keys]
+
+        # Initialize a dictionary to store aggregated statistics
+        aggregated_stats = {}
+
+        for key in keys:
+            keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+            window_size, rmse_threshold = (TrackingBenchmarkSettingsLookup & key).fetch1('window_size', 'rmse_threshold')
+
+            min_events = np.inf
+            for keypoint_datum in keypoint_data:
+                num_events = np.sum(keypoint_datum['tracking_events'])
+                if num_events < min_events:
+                    min_events = num_events
+
+            for keypoint_datum in keypoint_data:
+                start_frame_idx = keypoint_datum['start_frame_idx']
+                forward_pose = keypoint_datum['forward_pose']
+                forward_rmse = keypoint_datum['forward_rmse']
+                try:
+                    forward_break_off_duration = np.where(forward_rmse[start_frame_idx:] > rmse_threshold)[0][0]
+                except:
+                    forward_break_off_duration = len(forward_rmse) - start_frame_idx
+
+                middle_frame_idx = keypoint_datum['middle_frame_idx']
+                bothway_pose = keypoint_datum['bothway_pose']
+                bothway_rmse = keypoint_datum['bothway_rmse']
+                try:
+                    bothway_break_off_forward_duration = np.where(bothway_rmse[middle_frame_idx:] > rmse_threshold)[0][0]
+                except:
+                    bothway_break_off_forward_duration = len(bothway_rmse) - middle_frame_idx
+
+                try:
+                    bothway_break_off_backward_duration = len(bothway_rmse[:middle_frame_idx]) - np.where(bothway_rmse[:middle_frame_idx] > rmse_threshold)[0][::-1][0]
+                except:
+                    bothway_break_off_backward_duration = middle_frame_idx
+
+                subject_id = keypoint_datum['subject_id']
+                segment_name = keypoint_datum['segment_name']
+                avg_rmse = np.nanmean(keypoint_datum['rmse'])
+                num_events = np.sum(keypoint_datum['tracking_events']) - min_events
+
+                if segment_name not in aggregated_stats:
+                    aggregated_stats[segment_name] = {
+                        'avg_rmse': [],
+                        'num_events': [],
+                        'forward_break_off_duration': [],
+                        'bothway_break_off_forward_duration': [],
+                        'bothway_break_off_backward_duration': []
+                    }
+
+                aggregated_stats[segment_name]['avg_rmse'].append(avg_rmse)
+                aggregated_stats[segment_name]['num_events'].append(num_events)
+                aggregated_stats[segment_name]['forward_break_off_duration'].append(forward_break_off_duration)
+                aggregated_stats[segment_name]['bothway_break_off_forward_duration'].append(bothway_break_off_forward_duration)
+                aggregated_stats[segment_name]['bothway_break_off_backward_duration'].append(bothway_break_off_backward_duration)
+
+        # Calculate the average statistics for each segment
         table_data = []
-        for keypoint_datum in keypoint_data:
-            subject_id = keypoint_datum['subject_id']
-            segment_name = keypoint_datum['segment_name']
-            avg_rmse = np.nanmean(keypoint_datum['rmse'])
-            num_events = np.sum(keypoint_datum['tracking_events']) - 9
-            
-            table_data.append([subject_id, segment_name, avg_rmse, num_events])
-        
+        for segment_name, stats in aggregated_stats.items():
+            avg_rmse = np.nanmean(stats['avg_rmse'])
+            num_events = np.mean(stats['num_events'])
+            forward_break_off_duration = np.mean(stats['forward_break_off_duration'])
+            bothway_break_off_forward_duration = np.mean(stats['bothway_break_off_forward_duration'])
+            bothway_break_off_backward_duration = np.mean(stats['bothway_break_off_backward_duration'])
+
+            table_data.append([segment_name, avg_rmse, num_events, forward_break_off_duration, bothway_break_off_forward_duration, bothway_break_off_backward_duration])
+
+        avg_text = 'Average' if len(keys) > 1 else ''
         # Create a DataFrame for better visualization
-        df = pd.DataFrame(table_data, columns=['Subject', 'Segment Name', 'Average RMSE', 'Number of Events'])
-        
-        # Plot the number of events
+        df = pd.DataFrame(table_data, columns=['Segment Name', f'{avg_text} RMSE', f'{avg_text} Number of Events', f'{avg_text} Hold Duration Forward', f'{avg_text} Hold Duration Bothway Forward', f'{avg_text} Hold Duration Bothway Backward'])
+
+        # Plot the average number of events
         plt.figure(figsize=(10, 6))
-        plt.bar(df['Segment Name'], df['Number of Events'], color='skyblue')
+        plt.bar(df['Segment Name'], df[f'{avg_text} Number of Events'], color='skyblue')
         plt.xlabel('Segment Name')
-        plt.ylabel('Number of Events (Normalized)')
-        plt.title('Number of Events per Segment')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt.show()
-        
-        # Plot the average RMSE
-        plt.figure(figsize=(10, 6))
-        plt.bar(df['Segment Name'], df['Average RMSE'], color='salmon')
-        plt.xlabel('Segment Name')
-        plt.ylabel('Average RMSE')
-        plt.title('Average RMSE per Segment')
+        plt.ylabel(f'{avg_text} Number of Events')
+        plt.title(f'{avg_text} Number of Events per Segment')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
         plt.show()
 
-        # Plot the total number of events per frame
-        total_events_per_frame = np.sum([keypoint_datum['tracking_events'] for keypoint_datum in keypoint_data], axis=0)
-        
+        # Plot the average RMSE
         plt.figure(figsize=(10, 6))
-        plt.plot(total_events_per_frame, color='purple')
-        plt.xlabel('Frames')
-        plt.ylabel('Total Number of Events')
-        plt.title('Total Number of Events per Frame')
+        plt.bar(df['Segment Name'], df[f'{avg_text} RMSE'], color='salmon')
+        plt.xlabel('Segment Name')
+        plt.ylabel(f'{avg_text} RMSE')
+        plt.title(f'{avg_text} RMSE per Segment')
+        plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
         plt.show()
+
+        # Plot the average hold durations
+        plt.figure(figsize=(10, 6))
+        plt.bar(df['Segment Name'], df[f'{avg_text} Hold Duration Forward'], color='salmon')
+        plt.xlabel('Segment Name')
+        plt.ylabel(f'{avg_text} Hold Duration Forward')
+        plt.title(f'{avg_text} Hold Duration Forward per Segment')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(df['Segment Name'], df[f'{avg_text} Hold Duration Bothway Forward'], color='salmon')
+        plt.xlabel('Segment Name')
+        plt.ylabel(f'{avg_text} Hold Duration Bothway Forward')
+        plt.title(f'{avg_text} Hold Duration Bothway Forward per Segment')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(df['Segment Name'], df[f'{avg_text} Hold Duration Bothway Backward'], color='salmon')
+        plt.xlabel('Segment Name')
+        plt.ylabel(f'{avg_text} Hold Duration Bothway Backward')
+        plt.title(f'{avg_text} Hold Duration Bothway Backward per Segment')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        if len(keys) == 1:
+            # Plot the total number of events per frame
+            keypoint_data = (TrackingBenchmark.TrackedKeypoint & key).fetch(as_dict=True)
+            total_events_per_frame = np.sum([keypoint_datum['tracking_events'] for keypoint_datum in keypoint_data], axis=0)
+            
+            plt.figure(figsize=(10, 6))
+            plt.plot(total_events_per_frame, color='purple')
+            plt.xlabel('Frames')
+            plt.ylabel('Total Number of Events')
+            plt.title('Total Number of Events per Frame')
+            plt.tight_layout()
+            plt.show()
 
         return df
 
@@ -425,4 +641,4 @@ class TrackingBenchmark(dj.Computed):
 if __name__ == "__main__":
     session_to_benchmark = Session * (TrackingBenchmarkSettingsLookup & 'setting_id=1')
     TrackingBenchmark.populate(session_to_benchmark)
-    TrackingBenchmark.render_overlay(session_to_benchmark, 'tracked.mp4')
+    # TrackingBenchmark.render_overlay(session_to_benchmark, 'tracked.mp4')

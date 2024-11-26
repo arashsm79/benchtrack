@@ -105,4 +105,3 @@ def import_from_horse30(dir_path: str):
                 }, skip_duplicates=True)
 
             print(f"Imported {subject_name}.")
-            return
